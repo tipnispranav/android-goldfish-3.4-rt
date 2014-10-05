@@ -45,7 +45,6 @@
 #include <linux/debugobjects.h>
 #include <linux/sched.h>
 #include <linux/timer.h>
-#include <linux/freezer.h>
 
 #include <asm/uaccess.h>
 
@@ -63,7 +62,6 @@
 DEFINE_PER_CPU(struct hrtimer_cpu_base, hrtimer_bases) =
 {
 
-	.lock = __RAW_SPIN_LOCK_UNLOCKED(hrtimer_bases.lock),
 	.clock_base =
 	{
 		{
@@ -299,10 +297,6 @@ ktime_t ktime_sub_ns(const ktime_t kt, u64 nsec)
 		tmp.tv64 = nsec;
 	} else {
 		unsigned long rem = do_div(nsec, NSEC_PER_SEC);
-
-		/* Make sure nsec fits into long */
-		if (unlikely(nsec > KTIME_SEC_MAX))
-			return (ktime_t){ .tv64 = KTIME_MAX };
 
 		tmp = ktime_set((long)nsec, rem);
 	}
@@ -649,16 +643,19 @@ static inline void hrtimer_init_hres(struct hrtimer_cpu_base *base)
  * and expiry check is done in the hrtimer_interrupt or in the softirq.
  */
 static inline int hrtimer_enqueue_reprogram(struct hrtimer *timer,
-					    struct hrtimer_clock_base *base)
+					    struct hrtimer_clock_base *base,
+					    int wakeup)
 {
-       if (base->cpu_base->hres_active && hrtimer_reprogram(timer, base)) {
-#ifdef CONFIG_PREEMPT_RT_BASE
-               /*
-                * Move softirq based timers away from the rbtree in
-                * case it expired already. Otherwise we would have a
-                * stale base->first entry until the softirq runs.
-                */
+	if (base->cpu_base->hres_active && hrtimer_reprogram(timer, base)) {
+		if (!wakeup)
+			return -ETIME;
 
+#ifdef CONFIG_PREEMPT_RT_BASE
+		/*
+		 * Move softirq based timers away from the rbtree in
+		 * case it expired already. Otherwise we would have a
+		 * stale base->first entry until the softirq runs.
+		 */
 		if (!hrtimer_rt_defer(timer))
 			return -ETIME;
 #endif
@@ -667,14 +664,9 @@ static inline int hrtimer_enqueue_reprogram(struct hrtimer *timer,
 		raw_spin_lock(&base->cpu_base->lock);
 
 		return 0;
-}
+	}
 
-static inline ktime_t hrtimer_update_base(struct hrtimer_cpu_base *base)
-{
-	ktime_t *offs_real = &base->clock_base[HRTIMER_BASE_REALTIME].offset;
-	ktime_t *offs_boot = &base->clock_base[HRTIMER_BASE_BOOTTIME].offset;
-
-	return ktime_get_update_offsets(offs_real, offs_boot);
+	return 0;
 }
 
 /*
@@ -685,12 +677,22 @@ static inline ktime_t hrtimer_update_base(struct hrtimer_cpu_base *base)
 static void retrigger_next_event(void *arg)
 {
 	struct hrtimer_cpu_base *base = &__get_cpu_var(hrtimer_bases);
+	struct timespec realtime_offset, xtim, wtm, sleep;
 
 	if (!hrtimer_hres_active())
 		return;
 
+	/* Optimized out for !HIGH_RES */
+	get_xtime_and_monotonic_and_sleep_offset(&xtim, &wtm, &sleep);
+	set_normalized_timespec(&realtime_offset, -wtm.tv_sec, -wtm.tv_nsec);
+
+	/* Adjust CLOCK_REALTIME offset */
 	raw_spin_lock(&base->lock);
-	hrtimer_update_base(base);
+	base->clock_base[HRTIMER_BASE_REALTIME].offset =
+		timespec_to_ktime(realtime_offset);
+	base->clock_base[HRTIMER_BASE_BOOTTIME].offset =
+		timespec_to_ktime(sleep);
+
 	hrtimer_force_reprogram(base, 0);
 	raw_spin_unlock(&base->lock);
 }
@@ -720,26 +722,11 @@ static int hrtimer_switch_to_hres(void)
 		base->clock_base[i].resolution = KTIME_HIGH_RES;
 
 	tick_setup_sched_timer();
+
 	/* "Retrigger" the interrupt to get things going */
 	retrigger_next_event(NULL);
 	local_irq_restore(flags);
 	return 1;
-}
-
-static void clock_was_set_work(struct work_struct *work)
-{
-	clock_was_set();
-}
-
-static DECLARE_WORK(hrtimer_work, clock_was_set_work);
-
-/*
- * Called from timekeeping and resume code to reprogramm the hrtimer
- * interrupt device on all cpus.
- */
-void clock_was_set_delayed(void)
-{
-	schedule_work(&hrtimer_work);
 }
 
 #else
@@ -750,7 +737,8 @@ static inline int hrtimer_switch_to_hres(void) { return 0; }
 static inline void
 hrtimer_force_reprogram(struct hrtimer_cpu_base *base, int skip_equal) { }
 static inline int hrtimer_enqueue_reprogram(struct hrtimer *timer,
-					    struct hrtimer_clock_base *base)
+					    struct hrtimer_clock_base *base,
+					    int wakeup)
 {
 	return 0;
 }
@@ -793,10 +781,8 @@ void hrtimers_resume(void)
 	WARN_ONCE(!irqs_disabled(),
 		  KERN_INFO "hrtimers_resume() called with IRQs enabled!");
 
-	/* Retrigger on the local CPU */
 	retrigger_next_event(NULL);
-	/* And schedule a retrigger for all others */
-	clock_was_set_delayed();
+	timerfd_clock_was_set();
 }
 
 static inline void timer_stats_hrtimer_set_start_info(struct hrtimer *timer)
@@ -1047,21 +1033,20 @@ int __hrtimer_start_range_ns(struct hrtimer *timer, ktime_t tim,
 	 *
 	 * XXX send_remote_softirq() ?
 	 */
-       if (leftmost && new_base->cpu_base == &__get_cpu_var(hrtimer_bases)) {
-               ret = hrtimer_enqueue_reprogram(timer, new_base, wakeup);
-               if (ret) {
-                       /*
-                        * In case we failed to reprogram the timer (mostly
-                        * because out current timer is already elapsed),
-                        * remove it again and report a failure. This avoids
-                        * stale base->first entries.
-                        */
+	if (leftmost && new_base->cpu_base == &__get_cpu_var(hrtimer_bases)) {
+		ret = hrtimer_enqueue_reprogram(timer, new_base, wakeup);
+		if (ret) {
+			/*
+			 * In case we failed to reprogram the timer (mostly
+			 * because out current timer is already elapsed),
+			 * remove it again and report a failure. This avoids
+			 * stale base->first entries.
+			 */
 			debug_deactivate(timer);
-                       __remove_hrtimer(timer, new_base,
-                                       timer->state & HRTIMER_STATE_CALLBACK, 0);
-               }
-       }
-
+			__remove_hrtimer(timer, new_base,
+					timer->state & HRTIMER_STATE_CALLBACK, 0);
+		}
+	}
 
 	unlock_hrtimer_base(timer, &flags);
 
@@ -1442,10 +1427,11 @@ void hrtimer_interrupt(struct clock_event_device *dev)
 	cpu_base->nr_events++;
 	dev->next_event.tv64 = KTIME_MAX;
 
-	raw_spin_lock(&cpu_base->lock);
-	entry_time = now = hrtimer_update_base(cpu_base);
+	entry_time = now = ktime_get();
 retry:
 	expires_next.tv64 = KTIME_MAX;
+
+	raw_spin_lock(&cpu_base->lock);
 	/*
 	 * We set expires_next to KTIME_MAX here with cpu_base->lock
 	 * held to prevent that a timer is enqueued in our queue via
@@ -1497,8 +1483,6 @@ retry:
 
 				expires = ktime_sub(hrtimer_get_expires(timer),
 						    base->offset);
-				if (expires.tv64 < 0)
-					expires.tv64 = KTIME_MAX;
 				if (expires.tv64 < expires_next.tv64)
 					expires_next = expires;
 				break;
@@ -1538,12 +1522,8 @@ retry:
 	 * We need to prevent that we loop forever in the hrtimer
 	 * interrupt routine. We give it 3 attempts to avoid
 	 * overreacting on some spurious event.
-	 *
-	 * Acquire base lock for updating the offsets and retrieving
-	 * the current time.
 	 */
-	raw_spin_lock(&cpu_base->lock);
-	now = hrtimer_update_base(cpu_base);
+	now = ktime_get();
 	cpu_base->nr_retries++;
 	if (++retries < 3)
 		goto retry;
@@ -1555,7 +1535,6 @@ retry:
 	 */
 	cpu_base->nr_hangs++;
 	cpu_base->hang_detected = 1;
-	raw_spin_unlock(&cpu_base->lock);
 	delta = ktime_sub(now, entry_time);
 	if (delta.tv64 > cpu_base->max_hang_time.tv64)
 		cpu_base->max_hang_time = delta;
@@ -1721,7 +1700,7 @@ static int __sched do_nanosleep(struct hrtimer_sleeper *t, enum hrtimer_mode mod
 			t->task = NULL;
 
 		if (likely(t->task))
-			freezable_schedule();
+			schedule();
 
 		hrtimer_cancel(&t->timer);
 		mode = HRTIMER_MODE_ABS;
@@ -1838,6 +1817,8 @@ static void __cpuinit init_hrtimers_cpu(int cpu)
 {
 	struct hrtimer_cpu_base *cpu_base = &per_cpu(hrtimer_bases, cpu);
 	int i;
+
+	raw_spin_lock_init(&cpu_base->lock);
 
 	for (i = 0; i < HRTIMER_MAX_CLOCK_BASES; i++) {
 		cpu_base->clock_base[i].cpu_base = cpu_base;

@@ -294,7 +294,7 @@ extern void hrtimer_peek_ahead_timers(void);
 # define MONOTONIC_RES_NSEC	HIGH_RES_NSEC
 # define KTIME_MONOTONIC_RES	KTIME_HIGH_RES
 
-extern void clock_was_set_delayed(void);
+//extern void clock_was_set_delayed(void);
 
 #else
 
@@ -317,7 +317,7 @@ static inline int hrtimer_is_hres_active(struct hrtimer *timer)
 	return 0;
 }
 
-static inline void clock_was_set_delayed(void) { }
+//static inline void clock_was_set_delayed(void) { }
 
 #endif
 
