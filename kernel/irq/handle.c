@@ -172,11 +172,10 @@ handle_irq_event_percpu(struct irq_desc *desc, struct irqaction *action)
 		action = action->next;
 	} while (action);
 
-	add_interrupt_randomness(irq, flags);
 #ifndef CONFIG_PREEMPT_RT_FULL
 	/* FIXME: Can we unbreak that ? */
-	if (random & IRQF_SAMPLE_RANDOM)
-		add_interrupt_randomness(irq);
+	if (flags & IRQF_SAMPLE_RANDOM)
+		add_interrupt_randomness(irq, flags);
 #endif
 
 	if (!noirqdebug)
